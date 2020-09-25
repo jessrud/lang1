@@ -1,0 +1,191 @@
+#!/bin/bash
+
+read -r -d '' RULES <<END
+	test_bytebuf)
+		compile common/bytebuf.c -DTESTING
+		link test_bytebuf
+	;;
+	test_lexer)
+		compile lexer.c -DTESTING
+		compile common/bytebuf.c
+		link test_lexer
+	;;
+    test_parser)
+        compile parser.c -DTESTING
+        compile lexer.c
+        compile common/bytebuf.c
+        link test_parser
+    ;;
+    
+END
+
+
+read -r -d '' builder <<END
+    case \$file in
+    $RULES
+        *)
+        fail "No such target '\$file'"
+        ;;
+    esac
+END
+
+set -euo pipefail
+shopt -s inherit_errexit
+shopt -s globstar
+function usage {
+cat <<EOF
+usage:
+
+  $0 build <target>
+  $0 test <target>
+  $0 clean
+  $0 shell
+EOF
+}
+
+SELF="$(realpath ${BASH_SOURCE[0]})"
+BD="$(dirname $SELF)"
+
+declare -A DIR
+DIR[project]="$BD"
+DIR[source]="$BD/src"
+DIR[build]="$BD/build"
+DIR[cache]="${DIR[build]}/cache"
+DIR[bin]="${DIR[build]}/bin"
+DIR[lib]="${DIR[build]}/lib"
+CACHE=""
+
+: ${CC:=clang}
+: ${CFLAGS:=--std=c11 -Wall -Wextra -pedantic -I${DIR[project]}}
+: ${LDFLAGS:=""}
+DFLAGS="-g -O0 -fsanitize=address -fsanitize=undefined"
+
+# setup directory structure
+for dir in ${DIR[@]}; do
+	mkdir -p $dir
+done
+
+CFILES=( `find ${DIR[source]} -type f | grep ".c\$"` )
+
+export DIR CC CFLAGS LDFLAGS DFLAGS
+
+cd "${DIR[project]}"
+
+function fail {
+	>&2 echo $@
+	exit 1
+}
+
+## poor mans ccache
+function cached {
+        local file=$1
+	shift
+	## TODO: figure out how to exit early if $CC -E fails
+		local ppdata; pdata=`$CC $@ -E $file` || fail "failed to comput hash for $file"
+	local hash; hash=`cat <(echo $@) <(echo "$pdata") | sha1sum | cut -d' ' -f1`
+
+
+	echo "${DIR[cache]}/${hash}.o"
+}
+
+function compile {
+	local base=$1
+	local fullpath="${DIR[source]}/$1"
+	shift
+	local obj; obj=`cached $fullpath $CFLAGS $@`
+	if [ ! -f $obj ]; then
+		echo "$CC $CFLAGS $@ -c $fullpath -o $obj"
+		$CC $CFLAGS $@ -c $fullpath -o $obj || fail "failed to compile $base"
+	fi
+	CACHE="$CACHE $obj"
+}
+
+function link {
+	local name=$1
+	shift
+	
+	echo "$CC <cached> $@ $CFLAGS $LDFLAGS -o ${DIR[bin]}/$name"
+	$CC $CACHE $@ $CFLAGS $LDFLAGS -o "${DIR[bin]}/$name" || fail "failed to link $name"
+	cd ${DIR[project]}
+	CACHE=""
+}
+
+function build {
+    for file in $@; do
+        echo ">> Building $file..."
+        source <(echo "$builder")
+    done
+}
+
+function test {
+    CFLAGS="$CFLAGS $DFLAGS"
+    for module in $@; do
+        build test_$module
+    done
+    set +e
+    local test_pass=0
+    local this_test=1
+    local test_total=$#
+    
+    for module in $@; do
+        
+        echo  ">> Test #$this_test : $module..."
+
+        { "${DIR[bin]}/test_$module" && test_pass=$(( "$test_pass" + 1 )); } || echo test $module FAILED
+        this_test=$(( "$this_test" + 1 ))
+
+        
+    done
+    echo ">> Tests $test_pass of $test_total pass"
+}
+function clean {
+	rm -rf ${DIR[build]}
+}
+
+function shell {
+    export PATH="${PWD}:${DIR[bin]}:$PATH"
+
+    while read -e -p "$PWD >> batre > " input; do
+        eval $input || true
+    done
+}
+
+function format {
+
+    clang-format -i "${DIR[source]}"/**/*.{c,h}
+}
+
+echo ""
+echo "BATRE (Build Automation Tool (Really Excellent)"
+echo ""
+
+if [[ $# == 0 ]]; then
+    usage
+    fail ""
+fi
+
+_cmd=$1
+shift
+
+case $_cmd in
+    test)
+        test $@
+        ;;
+    build)
+        build $@
+        ;;
+    shell)
+        shell
+        ;;
+    clean)
+        clean
+        ;;
+    format)
+        format
+        ;;
+   *)
+        usage
+        ;;
+esac
+echo ""
+
